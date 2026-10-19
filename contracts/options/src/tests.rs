@@ -631,6 +631,99 @@ fn test_partial_exercise_releases_only_the_exercised_reserve() {
 }
 
 #[test]
+fn test_cancel_returns_unfilled_collateral_and_releases_reserve() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, minter) = mint_call_option(&env, &client, &underlying, &quote);
+    let token = soroban_sdk::token::Client::new(&env, &underlying);
+
+    client.cancel(&minter, &option_id);
+
+    assert_eq!(token.balance(&minter), 20_000_000);
+    assert_eq!(token.balance(&client.address), 0);
+    assert_eq!(client.get_reserved_collateral(&minter, &underlying), 0);
+    assert!(!client.get_option_collateral_health(&option_id).active);
+    assert_eq!(
+        client.try_exercise(&Address::generate(&env), &option_id),
+        Err(Ok(crate::OptionsError::AlreadyCancelled))
+    );
+}
+
+#[test]
+fn test_cancel_cannot_be_repeated_or_expired() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, minter) = mint_call_option(&env, &client, &underlying, &quote);
+
+    client.cancel(&minter, &option_id);
+    assert_eq!(
+        client.try_cancel(&minter, &option_id),
+        Err(Ok(crate::OptionsError::AlreadyCancelled))
+    );
+    assert_eq!(
+        client.try_expire(&option_id),
+        Err(Ok(crate::OptionsError::AlreadyCancelled))
+    );
+}
+
+#[test]
+fn test_cancel_after_partial_exercise_returns_only_remaining_collateral() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, minter) = mint_call_option(&env, &client, &underlying, &quote);
+    let exerciser = Address::generate(&env);
+    mint_tokens(&env, &quote, &exerciser, 200_000_000);
+    let token = soroban_sdk::token::Client::new(&env, &underlying);
+
+    env.ledger().set_timestamp(750);
+    client.exercise_partial(&exerciser, &option_id, &4_000_000);
+    client.cancel(&minter, &option_id);
+
+    assert_eq!(token.balance(&exerciser), 4_000_000);
+    assert_eq!(token.balance(&minter), 16_000_000);
+    assert_eq!(token.balance(&client.address), 0);
+    assert_eq!(client.get_reserved_collateral(&minter, &underlying), 0);
+}
+
+#[test]
+fn test_cancel_after_expiration_requires_expire_path() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, minter) = mint_call_option(&env, &client, &underlying, &quote);
+    let token = soroban_sdk::token::Client::new(&env, &underlying);
+
+    env.ledger().set_timestamp(1001);
+    assert_eq!(
+        client.try_cancel(&minter, &option_id),
+        Err(Ok(crate::OptionsError::CancellationWindowClosed))
+    );
+    assert_eq!(token.balance(&minter), 10_000_000);
+    client.expire(&option_id);
+    assert_eq!(token.balance(&minter), 20_000_000);
+    assert_eq!(client.get_reserved_collateral(&minter, &underlying), 0);
+}
+
+#[test]
+fn test_cancel_requires_the_minter() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, _) = mint_call_option(&env, &client, &underlying, &quote);
+    let other = Address::generate(&env);
+
+    assert_eq!(
+        client.try_cancel(&other, &option_id),
+        Err(Ok(crate::OptionsError::Unauthorized))
+    );
+}
+
+#[test]
+fn test_cancel_requires_authorization() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, minter) = mint_call_option(&env, &client, &underlying, &quote);
+    let token = soroban_sdk::token::Client::new(&env, &underlying);
+
+    env.mock_auths(&[]);
+    assert!(client.try_cancel(&minter, &option_id).is_err());
+    assert_eq!(token.balance(&minter), 10_000_000);
+    assert_eq!(token.balance(&client.address), 10_000_000);
+}
+
+#[test]
 fn test_partial_exercise_rejects_zero_and_excess_amounts() {
     let (env, client, _, _, underlying, quote) = setup_env();
     let (option_id, _) = mint_call_option(&env, &client, &underlying, &quote);
@@ -693,6 +786,10 @@ fn test_finishing_partial_exercise_closes_position_and_clears_reserve() {
 
     assert_eq!(
         client.try_exercise(&exerciser, &option_id),
+        Err(Ok(crate::OptionsError::AlreadyExercised))
+    );
+    assert_eq!(
+        client.try_cancel(&minter, &option_id),
         Err(Ok(crate::OptionsError::AlreadyExercised))
     );
     // The stored record keeps the original collateral amount.

@@ -10,6 +10,7 @@
 - `mint(minter, option_type, underlying_asset, quote_asset, strike_price, opening_time, expiration_time, collateral_amount)`
 - `exercise(exerciser, option_id)` exercises all remaining collateral
 - `exercise_partial(exerciser, option_id, amount)` exercises part of the collateral
+- `cancel(minter, option_id)` cancels an unexpired option and returns its unexercised collateral
 - `expire(option_id)`
 - `deposit(owner, asset, amount)` / `withdraw(owner, asset, amount)`
 - `get_free_collateral(owner, asset)` / `get_reserved_collateral(owner, asset)`
@@ -21,6 +22,7 @@
 - `mint`
 - `exercise` (position fully exercised)
 - `partial` (part of the collateral exercised)
+- `cancel`
 - `expire`
 - `deposit`
 - `withdraw`
@@ -40,13 +42,19 @@ Collateral held by the contract is tracked per `(owner, asset)` in two buckets:
 the shortfall from their wallet (so minting without a deposit works as before).
 The full `collateral_amount` is then reserved. The reserve is released as the
 collateral leaves the contract: by `exercise` / `exercise_partial` (the exercised
-amount) and by `expire` (whatever was not exercised). `withdraw` can only take
+amount), by `cancel` (the unexercised amount while the option is active), and by
+`expire` (whatever was not exercised). `withdraw` can only take
 free collateral, so it fails with `InsufficientFreeCollateral` rather than
 undercollateralize an open position.
 
 Positions minted before reserve tracking existed have no recorded reserve;
 releasing their collateral saturates at zero. Their collateral was never in the
 free bucket, so it was never withdrawable.
+
+The minter can cancel an option through its expiration timestamp. Cancellation
+returns only the collateral not already paid out by partial exercises and
+releases the same amount from the reserved balance. After expiration, the
+existing permissionless `expire` path handles the return.
 
 ## Oracle Freshness Guard
 

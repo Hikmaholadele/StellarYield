@@ -1,8 +1,9 @@
-#mo_std
-[allow(clippy::too_many_arguments)]
+#![no_std]
+#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, symbol_short, token, Address, Env,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
+    Address, Env,
 };
 
 mod math;
@@ -12,12 +13,12 @@ mod tests;
 
 use math::black_scholes_call;
 use storage::{
-    clear_oracle_max_age, has_admin, read_admin, read_exercised_amount, read_free_collateral,
-    read_option, read_option_counter, read_oracle, read_oracle_max_age, read_reserved_collateral,
-    read_storage_version, release_reserved, write_admin, write_exercised_amount,
-    write_free_collateral, write_option, write_option_counter, write_oracle,
-    write_oracle_max_age, write_reserved_collateral, write_storage_version, OptionData,
-    OptionType, CURRENT_STORAGE_VERSION,
+    clear_oracle_max_age, has_admin, read_admin, read_cancelled, read_exercised_amount,
+    read_free_collateral, read_option, read_option_counter, read_oracle, read_oracle_max_age,
+    read_reserved_collateral, read_storage_version, release_reserved, write_admin, write_cancelled,
+    write_exercised_amount, write_free_collateral, write_option, write_option_counter,
+    write_oracle, write_oracle_max_age, write_reserved_collateral, write_storage_version,
+    OptionData, OptionType, CURRENT_STORAGE_VERSION,
 };
 
 #[contracterror]
@@ -51,6 +52,10 @@ pub enum OptionsError {
     StaleOracleObservation = 17,
     /// The oracle guard max age must be greater than zero.
     InvalidMaxAge = 18,
+    /// Cancellation was attempted after the option's expiration time.
+    CancellationWindowClosed = 19,
+    /// The option has already been cancelled.
+    AlreadyCancelled = 20,
 }
 
 /// Price source consulted when the oracle guard is enabled. `get_price`
@@ -62,7 +67,8 @@ pub trait OracleInterface {
     fn get_price(env: Env, asset: Address) -> Option<(i128, u64)>;
 }
 
-#[soroban_sdk_derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollateralHealth {
     /// Collateral currently locked behind this position.
     pub reserved: i128,
@@ -87,7 +93,7 @@ impl OptionsContract {
         }
         write_admin(&env, &admin);
         write_oracle(&env, &oracle);
-        Ok()
+        Ok(())
     }
 
     /// Marks the current storage layout version. Existing option records stay
@@ -102,7 +108,7 @@ impl OptionsContract {
         if read_storage_version(&env) < CURRENT_STORAGE_VERSION {
             write_storage_version(&env, CURRENT_STORAGE_VERSION);
         }
-        Ok()
+        Ok(())
     }
 
     /// Enables the oracle guard: `mint` then requires a fresh observation from
@@ -187,7 +193,7 @@ impl OptionsContract {
         let reserved = read_reserved_collateral(&env, &minter, &collateral_asset);
         let new_reserved = reserved
             .checked_add(collateral_amount)
-            .ok(OptionsError::MathOverflow)?;
+            .ok_or(OptionsError::MathOverflow)?;
         write_reserved_collateral(&env, &minter, &collateral_asset, new_reserved);
 
         let mut counter = read_option_counter(&env);
@@ -238,14 +244,59 @@ impl OptionsContract {
         Self::settle(&env, exerciser, option_id, option, Some(amount))
     }
 
+    /// Cancels an unexpired option and returns only its unexercised collateral
+    /// to the minter. The minter must authorize the cancellation.
+    pub fn cancel(env: Env, minter: Address, option_id: u32) -> Result<(), OptionsError> {
+        minter.require_auth();
+        let option = read_option(&env, option_id);
+
+        if option.minter != minter {
+            return Err(OptionsError::Unauthorized);
+        }
+        if read_cancelled(&env, option_id) {
+            return Err(OptionsError::AlreadyCancelled);
+        }
+        if option.exercised {
+            return Err(OptionsError::AlreadyExercised);
+        }
+        if option.expired {
+            return Err(OptionsError::AlreadyExpired);
+        }
+        if env.ledger().timestamp() > option.expiration_time {
+            return Err(OptionsError::CancellationWindowClosed);
+        }
+
+        let collateral_asset = match option.option_type {
+            OptionType::Call => option.underlying_asset.clone(),
+            OptionType::Put => option.quote_asset.clone(),
+        };
+        let remaining = option.collateral_amount - read_exercised_amount(&env, option_id);
+
+        token::Client::new(&env, &collateral_asset).transfer(
+            &env.current_contract_address(),
+            &minter,
+            &remaining,
+        );
+        release_reserved(&env, &minter, &collateral_asset, remaining);
+        write_cancelled(&env, option_id);
+
+        env.events()
+            .publish((symbol_short!("cancel"), option_id), (minter, remaining));
+
+        Ok(())
+    }
+
     pub fn expire(env: Env, option_id: u32) -> Result<(), OptionsError> {
         let mut option = read_option(&env, option_id);
 
+        if read_cancelled(&env, option_id) {
+            return Err(OptionsError::AlreadyCancelled);
+        }
         if option.exercised || option.expired {
             return Err(OptionsError::AlreadyExpired);
         }
 
-        let current_time = env.ledger.timestamp();
+        let current_time = env.ledger().timestamp();
         // Expire is only callable after the exercise window closes
         if current_time <= option.expiration_time {
             return Err(OptionsError::NotExpired);
@@ -272,7 +323,7 @@ impl OptionsContract {
             (option.minter.clone(),),
         );
 
-        Ok()
+        Ok(())
     }
 
     /// Deposits `amount` of `asset` as free collateral. Free collateral can be
@@ -291,14 +342,14 @@ impl OptionsContract {
             return Err(OptionsError::ZeroAmount);
         }
         let free = read_free_collateral(&env, &owner, &asset);
-        let new_free = free.checked_add(amount).ok(OptionsError::MathOverflow)?;
+        let new_free = free.checked_add(amount).ok_or(OptionsError::MathOverflow)?;
 
         token::Client::new(&env, &asset).transfer(&owner, &env.current_contract_address(), &amount);
         write_free_collateral(&env, &owner, &asset, new_free);
 
         env.events()
             .publish((symbol_short!("deposit"), owner), (asset, amount));
-        Ok()
+        Ok(())
     }
 
     /// Withdraws `amount` of free collateral. Collateral reserved behind open
@@ -327,7 +378,7 @@ impl OptionsContract {
 
         env.events()
             .publish((symbol_short!("withdraw"), owner), (asset, amount));
-        Ok()
+        Ok(())
     }
 
     /// Collateral `owner` can withdraw right now.
@@ -355,7 +406,7 @@ impl OptionsContract {
 
         // Once exercised or expired, the position is closed and no collateral
         // remains reserved behind it.
-        let active = !option.exercised && !option.expired;
+        let active = !option.exercised && !option.expired && !read_cancelled(&env, option_id);
         let reserved = if active { remaining_obligation } else { 0 };
 
         CollateralHealth {
@@ -389,6 +440,9 @@ impl OptionsContract {
         mut option: OptionData,
         amount: Option<i128>,
     ) -> Result<(), OptionsError> {
+        if read_cancelled(env, option_id) {
+            return Err(OptionsError::AlreadyCancelled);
+        }
         // Guard: prevent double-exercise (repeated exercise cannot pay twice)
         if option.exercised {
             return Err(OptionsError::AlreadyExercised);
@@ -398,7 +452,7 @@ impl OptionsContract {
             return Err(OptionsError::AlreadyExpired);
         }
 
-        let current_time = env.ledger.timestamp();
+        let current_time = env.ledger().timestamp();
         if current_time < option.opening_time {
             return Err(OptionsError::TooEarly);
         }
@@ -434,7 +488,7 @@ impl OptionsContract {
 
         let new_exercised = already_exercised
             .checked_add(to_exercise)
-            .ok(OptionsError::MathOverflow)?;
+            .ok_or(OptionsError::MathOverflow)?;
         write_exercised_amount(env, option_id, new_exercised);
 
         if new_exercised >= option.collateral_amount {
@@ -447,10 +501,9 @@ impl OptionsContract {
             (exerciser, to_exercise),
         );
 
-        Ok()
+        Ok(())
     }
 }
-
 
 /// Requires the configured oracle to hold a valid, recent observation for
 /// `asset`. The observation must exist, carry a positive price, and be
